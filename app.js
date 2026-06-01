@@ -2,6 +2,7 @@ const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ63bPMfv33OrO9
 const GVIZ_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ63bPMfv33OrO9YaMrZGLHpnw_ztUZE4NakA4mR-_8KjJKPbd1q2T_QzpmJTB91kOmFWGBIe93i7vb/gviz/tq?gid=0&headers=1&tqx=out:json";
 const APPSCRIPT_URL = "https://script.google.com/macros/s/AKfycbz4CySViQBJaEjsGqwQWnjeL493UGmYBCEinRcNNQxNEnISyzBCyLDc4wb8-EVZ24usfQ/exec";
 const STORAGE_KEY = "reward-board-state-v2";
+const SYNC_INTERVAL_MS = 4000;
 
 const state = {
   students: [],
@@ -10,6 +11,8 @@ const state = {
   activePickerMode: "student",
   activeLeaderMode: "student",
   pickerSelection: null,
+  syncTimer: null,
+  lastLocalChangeAt: 0,
   timer: {
     initial: 60,
     remaining: 60,
@@ -118,6 +121,8 @@ function applyStudentRows(rows) {
   populateClassSelectors();
   renderAll();
   setSync(`${parsed.length} murid dimuat`);
+  syncFromBackend(true);
+  startSyncPolling();
 }
 
 function loadStudentsFromGviz() {
@@ -235,6 +240,73 @@ function saveLocalState() {
   }));
 }
 
+function startSyncPolling() {
+  if (state.syncTimer) return;
+  state.syncTimer = setInterval(() => syncFromBackend(false), SYNC_INTERVAL_MS);
+}
+
+async function syncFromBackend(force) {
+  if (!force && Date.now() - state.lastLocalChangeAt < 2500) return;
+  try {
+    const backendState = await loadBackendState();
+    if (!backendState || !backendState.ok) throw new Error("State backend tidak sah");
+    state.scores = backendState.scores || {};
+    state.groups = backendState.groups || {};
+    ensureScoreKeys();
+    ensureGroupsForClasses();
+    saveLocalState();
+    renderAll();
+    setSync(`Sync ${new Date().toLocaleTimeString("ms-MY", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`);
+  } catch (error) {
+    setSync("Sync tempatan");
+    console.warn(error);
+  }
+}
+
+function loadBackendState() {
+  return new Promise((resolve, reject) => {
+    const callbackName = `__rewardBoardSync_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+    const script = document.createElement("script");
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Sync Google Sheet tamat masa"));
+    }, 7000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      delete window[callbackName];
+      script.remove();
+    };
+
+    window[callbackName] = (payload) => {
+      cleanup();
+      resolve(payload);
+    };
+
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("Tidak dapat membaca sync Google Sheet"));
+    };
+    script.src = `${APPSCRIPT_URL}?action=getState&callback=${callbackName}&cache=${Date.now()}`;
+    document.head.appendChild(script);
+  });
+}
+
+function markLocalChange() {
+  state.lastLocalChangeAt = Date.now();
+}
+
+function postBackendAction(payload) {
+  fetch(APPSCRIPT_URL, {
+    method: "POST",
+    mode: "no-cors",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...payload
+    })
+  }).catch(() => {});
+}
+
 function ensureScoreKeys() {
   state.students.forEach((student) => {
     if (!Number.isFinite(state.scores[student.id])) state.scores[student.id] = 0;
@@ -321,7 +393,13 @@ function generateRandomGroups() {
     groups[index % groupCount].members.push(student.id);
   });
   state.groups[className] = groups;
+  markLocalChange();
   saveLocalState();
+  postBackendAction({
+    action: "saveGroups",
+    className,
+    groups
+  });
   renderAll();
 }
 
@@ -334,7 +412,13 @@ function prepareManualGroups() {
     stars: 0,
     members: []
   }));
+  markLocalChange();
   saveLocalState();
+  postBackendAction({
+    action: "saveGroups",
+    className,
+    groups: state.groups[className]
+  });
   renderAll();
 }
 
@@ -416,7 +500,13 @@ function assignStudentToGroup(className, studentId, groupId) {
   const group = groups.find((item) => item.id === groupId);
   if (!group) return;
   group.members.push(studentId);
+  markLocalChange();
   saveLocalState();
+  postBackendAction({
+    action: "saveGroups",
+    className,
+    groups
+  });
   renderAll();
 }
 
@@ -442,10 +532,14 @@ function updateStudentScore(studentId, delta, sourceButton) {
   if (!student) return;
   const rewardOrigin = getRewardOrigin(sourceButton);
   state.scores[studentId] = Math.max(0, (state.scores[studentId] || 0) + delta);
+  markLocalChange();
   saveLocalState();
-  logReward({
-    type: "student",
+  postBackendAction({
+    action: "studentReward",
+    studentId,
+    studentName: student.name,
     className: student.className,
+    type: "student",
     targetName: student.name,
     delta,
     score: state.scores[studentId],
@@ -461,19 +555,33 @@ function updateGroupScore(className, groupId, delta, sourceButton) {
   const rewardOrigin = getRewardOrigin(sourceButton);
   group.stars = Math.max(0, (group.stars || 0) + delta);
   const affectedStudents = [];
+  const affectedStudentRecords = [];
   group.members.forEach((studentId) => {
     state.scores[studentId] = Math.max(0, (state.scores[studentId] || 0) + delta);
     const student = state.students.find((item) => item.id === studentId);
-    if (student) affectedStudents.push(student.name);
+    if (student) {
+      affectedStudents.push(student.name);
+      affectedStudentRecords.push({
+        id: student.id,
+        name: student.name,
+        className: student.className
+      });
+    }
   });
+  markLocalChange();
   saveLocalState();
-  logReward({
+  postBackendAction({
+    action: "groupReward",
     type: "group",
+    groupId,
+    groupName: group.name,
+    groups: state.groups[className],
     className,
     targetName: group.name,
     delta,
     score: group.stars,
-    affectedStudents
+    affectedStudents,
+    affectedStudentRecords
   });
   renderAll();
   animateReward(rewardOrigin, delta);
@@ -645,23 +753,10 @@ function resetScores() {
   Object.values(state.groups).flat().forEach((group) => {
     group.stars = 0;
   });
+  markLocalChange();
   saveLocalState();
-  logReward({ type: "reset", className: "Semua", targetName: "Reset Markah", delta: 0, score: 0, affectedStudents: [] });
+  postBackendAction({ action: "resetScores", type: "reset", className: "Semua", targetName: "Reset Markah", delta: 0, score: 0, affectedStudents: [] });
   renderAll();
-}
-
-function logReward(payload) {
-  const data = {
-    action: "logReward",
-    timestamp: new Date().toISOString(),
-    ...payload
-  };
-  fetch(APPSCRIPT_URL, {
-    method: "POST",
-    mode: "no-cors",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(data)
-  }).catch(() => {});
 }
 
 function getRewardOrigin(sourceButton) {
